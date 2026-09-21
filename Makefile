@@ -4,7 +4,7 @@
 CXX = g++
 CXXFLAGS = -std=c++20 -O2 -Wall -Wformat
 INCLUDES = -Iinclude -Isrc -Ilibs/imgui -Ilibs/imgui/backends -Ilibs/implot -Ilibs/json
-LDFLAGS = -mwindows -ld3d11 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32
+LDFLAGS = -mwindows -ld3d11 -ld3dcompiler -ldxgi -ldwmapi -limm32 -lgdi32 -lws2_32
 
 BUILD_DIR = build
 OBJ_DIR = $(BUILD_DIR)/obj
@@ -51,6 +51,6 @@ test: $(TEST_TARGET)
 
 $(TEST_TARGET): tests/test_core.cpp
 	@if not exist "$(call FIXPATH,$(BUILD_DIR))" mkdir "$(call FIXPATH,$(BUILD_DIR))"
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ -lws2_32
 
 .PHONY: all clean test

@@ -1,3 +1,7 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
@@ -12,6 +16,10 @@
 #include "core/recoil_serialization.hpp"
 #include "recorder/precision_timer.hpp"
 #include "recorder/recoil_generator.hpp"
+#include "recorder/telemetry_adapter.hpp"
+#include "recorder/burst_recorder.hpp"
+
+#include <memory>
 
 // Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -25,10 +33,18 @@ static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 
 // Application State (Recoil Pattern Recorder)
-static Recoil::WeaponProfile       g_activeWeapon;
-static Recoil::BurstGeneratorConfig g_simConfig;
-static Recoil::PrecisionTimer      g_testTimer;
-static int                         g_selectedRecordingIdx = -1;
+static Recoil::WeaponProfile          g_activeWeapon;
+static Recoil::BurstGeneratorConfig    g_simConfig;
+static Recoil::PrecisionTimer         g_testTimer;
+static int                            g_selectedRecordingIdx = -1;
+
+// Telemetry & State Machine Recorder (Tasks 2.3 & 2.4)
+static Recoil::BurstRecorder          g_burstRecorder;
+static std::unique_ptr<Recoil::UdpTelemetryAdapter> g_udpAdapter;
+static Recoil::ManualTelemetryAdapter g_manualAdapter;
+static int                            g_udpPort = 9988;
+static float                          g_manualDx = 0.5f;
+static float                          g_manualDy = -2.8f;
 
 // Forward declarations of helper functions
 bool CreateDeviceD3D(HWND hWnd);
@@ -94,6 +110,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
+    // Initialize Telemetry Adapters & Recorder (Tasks 2.3 & 2.4)
+    g_manualAdapter.Start();
+    g_burstRecorder.AttachAdapter(&g_manualAdapter);
+
+    g_udpAdapter = std::make_unique<Recoil::UdpTelemetryAdapter>(g_udpPort);
+    g_burstRecorder.AttachAdapter(g_udpAdapter.get());
+
     // Main application loop
     bool bRunning = true;
     while (bRunning)
@@ -118,6 +141,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CreateRenderTarget();
         }
 
+        // Tick State Machine Recorder (Task 2.4)
+        g_burstRecorder.Update();
+        if (g_burstRecorder.IsFinished()) {
+            Recoil::BurstRecording burst = g_burstRecorder.FinalizeBurst();
+            if (!burst.raw_shots.empty()) {
+                g_activeWeapon.recordings.push_back(burst);
+                g_selectedRecordingIdx = static_cast<int>(g_activeWeapon.recordings.size() - 1);
+            }
+        }
+
         // Start ImGui frame
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -125,6 +158,85 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         // Enable DockSpace
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+
+        // Panel: Live Telemetry & Burst Recorder (Tasks 2.3 & 2.4)
+        {
+            ImGui::Begin("Live Telemetry & Recorder (Tasks 2.3 & 2.4)");
+
+            // 2.4.1 State Machine Indicator
+            Recoil::RecorderState state = g_burstRecorder.GetState();
+            ImGui::Text("Recorder Status: ");
+            ImGui::SameLine();
+            if (state == Recoil::RecorderState::Recording) {
+                ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "[ RECORDING ACTIVE ]");
+            } else if (state == Recoil::RecorderState::BurstFinished) {
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "[ BURST FINISHED ]");
+            } else {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[ IDLE ]");
+            }
+
+            // 2.4.3 Live Shot Counter
+            ImGui::Separator();
+            ImGui::Text("Live Shots Recorded: %d", g_burstRecorder.GetLiveShotCount());
+            ImGui::Text("Burst Duration: %.2f ms", g_burstRecorder.GetElapsedMs());
+
+            // Recording Controls
+            if (state != Recoil::RecorderState::Recording) {
+                if (ImGui::Button("Start Recording Burst", ImVec2(200, 32))) {
+                    g_burstRecorder.StartRecording("burst_live", "telemetry");
+                }
+            } else {
+                if (ImGui::Button("Stop & Finalize Burst", ImVec2(200, 32))) {
+                    g_burstRecorder.StopRecording();
+                }
+            }
+
+            // 2.4.2 Auto-Finalize configuration
+            ImGui::Separator();
+            bool autoFin = g_burstRecorder.IsAutoFinalizeEnabled();
+            if (ImGui::Checkbox("Auto-Finalize on Silence", &autoFin)) {
+                g_burstRecorder.SetAutoFinalize(autoFin, g_burstRecorder.GetAutoFinalizeTimeoutMs());
+            }
+            int timeoutMs = static_cast<int>(g_burstRecorder.GetAutoFinalizeTimeoutMs());
+            if (ImGui::SliderInt("Silence Timeout (ms)", &timeoutMs, 100, 2000)) {
+                g_burstRecorder.SetAutoFinalize(autoFin, timeoutMs);
+            }
+
+            // 2.3.2 UDP Socket Telemetry Adapter
+            ImGui::Separator();
+            ImGui::Text("UDP Telemetry Receiver (Task 2.3.2)");
+            ImGui::Text("Port: %d (127.0.0.1)", g_udpPort);
+            if (g_udpAdapter && g_udpAdapter->IsActive()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "[ LISTENING ]");
+                if (ImGui::Button("Stop UDP Listener")) {
+                    g_udpAdapter->Stop();
+                }
+            } else {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "[ STOPPED ]");
+                if (ImGui::Button("Start UDP Listener")) {
+                    if (g_udpAdapter) g_udpAdapter->Start();
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Send Test UDP Packet")) {
+                // Kirim contoh tembakan loopback
+                Recoil::NetworkTestHelper::SendUdpPacket(g_udpPort, "0.75,-3.2,0");
+            }
+
+            // 2.3.3 Manual Trigger Fallback
+            ImGui::Separator();
+            ImGui::Text("Manual Input Trigger (Task 2.3.3)");
+            ImGui::SliderFloat("Manual ΔX", &g_manualDx, -5.0f, 5.0f, "%.2f");
+            ImGui::SliderFloat("Manual ΔY", &g_manualDy, -10.0f, 0.0f, "%.2f");
+            if (ImGui::Button("Trigger Manual Shot", ImVec2(180, 26))) {
+                g_manualAdapter.TriggerShot(g_manualDx, g_manualDy);
+            }
+
+            ImGui::End();
+        }
 
         // Panel: Precision Timer Status (Task 2.1)
         {

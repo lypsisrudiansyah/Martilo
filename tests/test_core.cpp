@@ -1,3 +1,8 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <windows.h>
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -8,6 +13,8 @@
 #include "../src/core/recoil_serialization.hpp"
 #include "../src/recorder/precision_timer.hpp"
 #include "../src/recorder/recoil_generator.hpp"
+#include "../src/recorder/telemetry_adapter.hpp"
+#include "../src/recorder/burst_recorder.hpp"
 
 // Simple unit test assertions with clear output
 #define ASSERT_TRUE(expr, msg) \
@@ -237,8 +244,132 @@ int main() {
         ASSERT_NEAR(avg_interval, 83.33f, 3.0f, "Average interval must be close to ~83.3ms for 720 RPM");
     }
 
+    // --- TEST 9: Milestone 2 Task 2.4.1 BurstRecorder State Machine Lifecycle ---
+    {
+        Recoil::BurstRecorder recorder;
+        ASSERT_TRUE(recorder.IsIdle(), "Initial recorder state must be IDLE");
+        ASSERT_TRUE(recorder.GetState() == Recoil::RecorderState::Idle, "Recorder state enum is Idle");
+
+        recorder.StartRecording("test_burst_sm", "telemetry_raw");
+        ASSERT_TRUE(recorder.IsRecording(), "Recorder state must be RECORDING after StartRecording()");
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 0, "Initial live shot count is 0");
+
+        recorder.StopRecording();
+        ASSERT_TRUE(recorder.IsFinished(), "Recorder state must be BURST_FINISHED after StopRecording()");
+
+        Recoil::BurstRecording burst = recorder.FinalizeBurst();
+        ASSERT_TRUE(recorder.IsIdle(), "Recorder state resets to IDLE after FinalizeBurst()");
+        ASSERT_TRUE(burst.recording_id == "test_burst_sm", "Burst ID preserved in finalized recording");
+    }
+
+    // --- TEST 10: Milestone 2 Task 2.4.3 Live Shot Counter & Ingestion ---
+    {
+        Recoil::BurstRecorder recorder;
+        recorder.StartRecording("burst_counter_test", "raw");
+
+        recorder.OnShotReceived(1.0f, -2.5f, 0);
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 1, "Live shot count is 1 after first shot");
+
+        recorder.OnShotReceived(-0.5f, -3.0f, 83);
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 2, "Live shot count is 2 after second shot");
+
+        recorder.OnShotReceived(0.2f, -3.2f, 166);
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 3, "Live shot count is 3 after third shot");
+
+        auto liveShots = recorder.GetLiveShotsCopy();
+        ASSERT_TRUE(liveShots.size() == 3, "Live shots copy has 3 elements");
+        ASSERT_NEAR(liveShots[0].cum_x, 1.0f, 1e-4f, "Shot 1 Cum X is 1.0");
+        ASSERT_NEAR(liveShots[1].cum_x, 0.5f, 1e-4f, "Shot 2 Cum X is 0.5");
+        ASSERT_NEAR(liveShots[2].cum_x, 0.7f, 1e-4f, "Shot 3 Cum X is 0.7");
+
+        ASSERT_NEAR(liveShots[0].cum_y, -2.5f, 1e-4f, "Shot 1 Cum Y is -2.5");
+        ASSERT_NEAR(liveShots[1].cum_y, -5.5f, 1e-4f, "Shot 2 Cum Y is -5.5");
+        ASSERT_NEAR(liveShots[2].cum_y, -8.7f, 1e-4f, "Shot 3 Cum Y is -8.7");
+
+        Recoil::BurstRecording burst = recorder.FinalizeBurst();
+        ASSERT_TRUE(burst.ShotCount() == 3, "Finalized burst contains 3 shots");
+    }
+
+    // --- TEST 11: Milestone 2 Task 2.4.2 Auto-Finalize Timeout Logic ---
+    {
+        Recoil::BurstRecorder recorder;
+        // Set timeout to 40ms for fast unit testing
+        recorder.SetAutoFinalize(true, 40);
+        ASSERT_TRUE(recorder.IsAutoFinalizeEnabled(), "Auto-finalize must be enabled");
+        ASSERT_TRUE(recorder.GetAutoFinalizeTimeoutMs() == 40, "Timeout setting matches 40ms");
+
+        recorder.StartRecording("auto_timeout_burst", "test");
+        recorder.OnShotReceived(0.5f, -2.0f); // shot with internal timer
+
+        // Immediate update: should still be recording
+        recorder.Update();
+        ASSERT_TRUE(recorder.IsRecording(), "Should still be recording immediately after shot");
+
+        // Sleep 60ms (> 40ms timeout)
+        ::Sleep(60);
+
+        recorder.Update();
+        ASSERT_TRUE(recorder.IsFinished(), "Should auto-finalize to BURST_FINISHED after timeout expires");
+
+        Recoil::BurstRecording burst = recorder.FinalizeBurst();
+        ASSERT_TRUE(burst.ShotCount() == 1, "Auto-finalized burst has 1 shot");
+    }
+
+    // --- TEST 12: Milestone 2 Task 2.3 Telemetry Adapters (Manual & UDP Socket) ---
+    {
+        // 1. Manual Telemetry Adapter
+        Recoil::BurstRecorder recorder;
+        Recoil::ManualTelemetryAdapter manualAdapter;
+        recorder.AttachAdapter(&manualAdapter);
+
+        manualAdapter.Start();
+        ASSERT_TRUE(manualAdapter.IsActive(), "Manual adapter is active");
+
+        recorder.StartRecording("manual_adapter_burst");
+        manualAdapter.TriggerShot(1.5f, -3.0f, 0);
+        manualAdapter.TriggerShot(0.5f, -2.5f, 83);
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 2, "Manual adapter properly dispatched 2 shots");
+        recorder.FinalizeBurst();
+
+        // 2. UDP Telemetry Adapter (127.0.0.1:9977)
+        int testPort = 9977;
+        Recoil::UdpTelemetryAdapter udpAdapter(testPort);
+        recorder.AttachAdapter(&udpAdapter);
+
+        bool udpStarted = udpAdapter.Start();
+        ASSERT_TRUE(udpStarted, "UDP Adapter successfully bound and started on port 9977");
+        ASSERT_TRUE(udpAdapter.IsActive(), "UDP Adapter is active");
+
+        recorder.StartRecording("udp_adapter_burst");
+
+        // Send CSV packet: "0.8,-3.5,0"
+        bool sentCsv = Recoil::NetworkTestHelper::SendUdpPacket(testPort, "0.8,-3.5,0");
+        ASSERT_TRUE(sentCsv, "Send CSV packet over UDP loopback succeeded");
+
+        // Brief sleep to allow background worker to recv and dispatch
+        ::Sleep(40);
+
+        // Send JSON packet: {"dx": 1.1, "dy": -3.8, "timeMs": 85}
+        bool sentJson = Recoil::NetworkTestHelper::SendUdpPacket(testPort, R"({"dx": 1.1, "dy": -3.8, "timeMs": 85})");
+        ASSERT_TRUE(sentJson, "Send JSON packet over UDP loopback succeeded");
+
+        ::Sleep(40);
+
+        ASSERT_TRUE(recorder.GetLiveShotCount() == 2, "UDP adapter received and parsed both CSV and JSON packets");
+
+        auto udpShots = recorder.GetLiveShotsCopy();
+        ASSERT_TRUE(udpShots.size() == 2, "Recorder holds 2 UDP shots");
+        ASSERT_NEAR(udpShots[0].delta_x, 0.8f, 1e-3f, "Shot 1 DX is 0.8");
+        ASSERT_NEAR(udpShots[0].delta_y, -3.5f, 1e-3f, "Shot 1 DY is -3.5");
+        ASSERT_NEAR(udpShots[1].delta_x, 1.1f, 1e-3f, "Shot 2 DX is 1.1");
+        ASSERT_NEAR(udpShots[1].delta_y, -3.8f, 1e-3f, "Shot 2 DY is -3.8");
+
+        udpAdapter.Stop();
+        ASSERT_TRUE(!udpAdapter.IsActive(), "UDP adapter successfully stopped");
+    }
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "ALL 8 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "ALL 12 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
