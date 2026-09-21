@@ -7,6 +7,12 @@
 #include "imgui_impl_dx11.h"
 #include "implot.h"
 
+#include "core/recoil_types.hpp"
+#include "core/recoil_math.hpp"
+#include "core/recoil_serialization.hpp"
+#include "recorder/precision_timer.hpp"
+#include "recorder/recoil_generator.hpp"
+
 // Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -17,6 +23,12 @@ static IDXGISwapChain*          g_pSwapChain = nullptr;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+// Application State (Recoil Pattern Recorder)
+static Recoil::WeaponProfile       g_activeWeapon;
+static Recoil::BurstGeneratorConfig g_simConfig;
+static Recoil::PrecisionTimer      g_testTimer;
+static int                         g_selectedRecordingIdx = -1;
 
 // Forward declarations of helper functions
 bool CreateDeviceD3D(HWND hWnd);
@@ -114,13 +126,142 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Enable DockSpace
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
-        // Simple Status Window
+        // Panel: Precision Timer Status (Task 2.1)
         {
-            ImGui::Begin("Status");
-            ImGui::Text("Recoil Pattern Recorder & Analyzer");
-            ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+            ImGui::Begin("Precision Timer (Task 2.1)");
+            ImGui::Text("Windows QPC Hardware Frequency: %lld Hz", (long long)g_testTimer.GetFrequencyHz());
             ImGui::Separator();
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "DirectX 11 + Dear ImGui + ImPlot Initialized successfully.");
+            
+            bool isRunning = g_testTimer.IsRunning();
+            if (!isRunning) {
+                if (ImGui::Button("Start Timer", ImVec2(120, 0))) {
+                    g_testTimer.Start();
+                }
+            } else {
+                if (ImGui::Button("Stop Timer", ImVec2(120, 0))) {
+                    g_testTimer.Stop();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset Timer", ImVec2(120, 0))) {
+                g_testTimer.Reset();
+            }
+
+            ImGui::Separator();
+            double elapsedMs = g_testTimer.GetElapsedMilliseconds();
+            double elapsedUs = g_testTimer.GetElapsedMicroseconds();
+            ImGui::Text("Elapsed Time (ms): %.4f ms", elapsedMs);
+            ImGui::Text("Elapsed Time (us): %.1f us", elapsedUs);
+            ImGui::Text("Resolution: < 1 microsecond (Sub-millisecond guaranteed)");
+            ImGui::End();
+        }
+
+        // Panel: Burst Simulator Controller (Task 2.2)
+        {
+            ImGui::Begin("Burst Simulator (Task 2.2)");
+            ImGui::Text("Mock Recoil Generator for Development & Testing");
+            ImGui::Separator();
+
+            ImGui::SliderInt("Shot Count", &g_simConfig.shot_count, 5, 60);
+            ImGui::SliderInt("Rate of Fire (RPM)", &g_simConfig.rpm, 300, 1200);
+            float stepMs = Recoil::Math::RpmToIntervalMs(g_simConfig.rpm);
+            ImGui::TextDisabled("Theoretical Interval: %.2f ms/shot", stepMs);
+
+            ImGui::SliderFloat("Vertical Kick", &g_simConfig.base_vertical_recoil, -8.0f, -0.5f, "%.2f px");
+            ImGui::SliderFloat("Horizontal Drift", &g_simConfig.horizontal_drift, -2.0f, 2.0f, "%.2f px");
+            ImGui::SliderFloat("Random Spread", &g_simConfig.random_spread, 0.0f, 2.0f, "%.2f px");
+            ImGui::SliderFloat("Timing Jitter", &g_simConfig.timing_jitter_ms, 0.0f, 5.0f, "%.2f ms");
+
+            ImGui::Separator();
+            if (ImGui::Button("Simulate Burst", ImVec2(160, 32))) {
+                Recoil::BurstRecording burst = Recoil::MockBurstGenerator::GenerateBurst(g_simConfig);
+                g_activeWeapon.recordings.push_back(burst);
+                g_selectedRecordingIdx = static_cast<int>(g_activeWeapon.recordings.size() - 1);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear All", ImVec2(100, 32))) {
+                g_activeWeapon.recordings.clear();
+                g_selectedRecordingIdx = -1;
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Recordings Stored: %d", (int)g_activeWeapon.recordings.size());
+            for (size_t i = 0; i < g_activeWeapon.recordings.size(); ++i) {
+                const auto& rec = g_activeWeapon.recordings[i];
+                char label[128];
+                snprintf(label, sizeof(label), "%s (%d shots)##%d", rec.recording_id.c_str(), (int)rec.ShotCount(), (int)i);
+                bool isSelected = (g_selectedRecordingIdx == (int)i);
+                if (ImGui::Selectable(label, isSelected)) {
+                    g_selectedRecordingIdx = (int)i;
+                }
+            }
+
+            ImGui::End();
+        }
+
+        // Panel: Recoil Trajectory 2D Chart (ImPlot)
+        {
+            ImGui::Begin("Recoil Trajectory (Chart Preview)");
+            if (g_selectedRecordingIdx >= 0 && g_selectedRecordingIdx < (int)g_activeWeapon.recordings.size()) {
+                const auto& rec = g_activeWeapon.recordings[g_selectedRecordingIdx];
+                
+                ImGui::Text("Active: %s | Shots: %d | Duration: %lld ms", 
+                    rec.recording_id.c_str(), (int)rec.ShotCount(), (long long)rec.TotalDurationMs());
+
+                if (!rec.raw_shots.empty()) {
+                    // Extract X and Y coords
+                    std::vector<float> xs(rec.raw_shots.size());
+                    std::vector<float> ys(rec.raw_shots.size());
+                    for (size_t i = 0; i < rec.raw_shots.size(); ++i) {
+                        xs[i] = rec.raw_shots[i].cum_x;
+                        ys[i] = -rec.raw_shots[i].cum_y; // Invert Y for screen display: upward kick goes UP
+                    }
+
+                    if (ImPlot::BeginPlot("Trajectory (Cumulative X / -Y)", ImVec2(-1, -1))) {
+                        ImPlot::SetupAxes("Cumulative Horizontal Drift (X)", "Cumulative Upward Climb (-Y)");
+                        ImPlot::PlotLine("Spray Line", xs.data(), ys.data(), (int)xs.size());
+                        ImPlot::PlotScatter("Shots", xs.data(), ys.data(), (int)xs.size());
+                        ImPlot::EndPlot();
+                    }
+                }
+            } else {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No burst recorded. Click 'Simulate Burst' in the simulator panel.");
+            }
+            ImGui::End();
+        }
+
+        // Panel: Shot Table Inspector
+        {
+            ImGui::Begin("Shot Data Table");
+            if (g_selectedRecordingIdx >= 0 && g_selectedRecordingIdx < (int)g_activeWeapon.recordings.size()) {
+                const auto& rec = g_activeWeapon.recordings[g_selectedRecordingIdx];
+                if (ImGui::BeginTable("ShotTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+                    ImGui::TableSetupColumn("Shot #");
+                    ImGui::TableSetupColumn("Time (ms)");
+                    ImGui::TableSetupColumn("Interval (ms)");
+                    ImGui::TableSetupColumn("Delta X");
+                    ImGui::TableSetupColumn("Delta Y");
+                    ImGui::TableSetupColumn("Cum X");
+                    ImGui::TableSetupColumn("Cum Y");
+                    ImGui::TableSetupColumn("Source");
+                    ImGui::TableHeadersRow();
+
+                    for (const auto& shot : rec.raw_shots) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn(); ImGui::Text("%d", shot.shot_index);
+                        ImGui::TableNextColumn(); ImGui::Text("%lld", (long long)shot.timestamp_ms);
+                        ImGui::TableNextColumn(); ImGui::Text("%.1f", shot.interval_ms);
+                        ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.delta_x);
+                        ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.delta_y);
+                        ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.cum_x);
+                        ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.cum_y);
+                        ImGui::TableNextColumn(); ImGui::Text("%s", shot.source.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+            } else {
+                ImGui::Text("No active recording selected.");
+            }
             ImGui::End();
         }
 

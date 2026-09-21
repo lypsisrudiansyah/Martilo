@@ -6,6 +6,8 @@
 #include "../src/core/recoil_math.hpp"
 
 #include "../src/core/recoil_serialization.hpp"
+#include "../src/recorder/precision_timer.hpp"
+#include "../src/recorder/recoil_generator.hpp"
 
 // Simple unit test assertions with clear output
 #define ASSERT_TRUE(expr, msg) \
@@ -168,8 +170,75 @@ int main() {
         ASSERT_TRUE(exportedJson["shots"].size() == 3, "Exported JSON shots count matches");
     }
 
+    // --- TEST 7: Milestone 2 Task 2.1 PrecisionTimer (Windows QPC) ---
+    {
+        Recoil::PrecisionTimer timer;
+        ASSERT_TRUE(timer.GetFrequencyHz() > 0, "QPC timer hardware frequency must be > 0");
+        ASSERT_TRUE(!timer.IsRunning(), "Timer should initially not be running");
+
+        timer.Start();
+        ASSERT_TRUE(timer.IsRunning(), "Timer should be running after Start()");
+
+        // Sleep 30 ms
+        ::Sleep(30);
+
+        double elapsed_ms = timer.GetElapsedMilliseconds();
+        double elapsed_us = timer.GetElapsedMicroseconds();
+        ASSERT_TRUE(elapsed_ms >= 25.0 && elapsed_ms <= 60.0, "Elapsed ms should accurately reflect ~30ms sleep");
+        ASSERT_TRUE(elapsed_us >= 25000.0, "Elapsed microseconds must be consistent");
+
+        double delta_ms = timer.GetDeltaMilliseconds();
+        ASSERT_TRUE(delta_ms >= 25.0, "GetDeltaMilliseconds() returns valid delta");
+
+        timer.Stop();
+        ASSERT_TRUE(!timer.IsRunning(), "Timer should be stopped");
+    }
+
+    // --- TEST 8: Milestone 2 Task 2.2 MockBurstGenerator ---
+    {
+        Recoil::BurstGeneratorConfig cfg;
+        cfg.shot_count = 30;
+        cfg.rpm = 720;
+        cfg.seed = 1337; // Deterministic seed
+
+        Recoil::BurstRecording burst = Recoil::MockBurstGenerator::GenerateBurst(cfg, "test_burst_01");
+
+        ASSERT_TRUE(burst.recording_id == "test_burst_01", "Burst recording ID matches");
+        ASSERT_TRUE(burst.ShotCount() == 30, "Generated burst must have exactly 30 shots");
+        ASSERT_TRUE(!burst.timestamp_iso.empty(), "Timestamp ISO must be set");
+
+        // First shot checks
+        ASSERT_TRUE(burst.raw_shots[0].shot_index == 1, "First shot index is 1");
+        ASSERT_TRUE(burst.raw_shots[0].timestamp_ms == 0, "First shot timestamp is 0");
+        ASSERT_TRUE(burst.raw_shots[0].interval_ms == 0.0f, "First shot interval is 0");
+        ASSERT_TRUE(burst.raw_shots[0].source == "simulated", "Source is 'simulated'");
+
+        // Subsequent shots checks
+        for (size_t i = 1; i < burst.raw_shots.size(); ++i) {
+            ASSERT_TRUE(burst.raw_shots[i].shot_index == static_cast<int>(i + 1), "Shot indices must be strictly sequential");
+            ASSERT_TRUE(burst.raw_shots[i].timestamp_ms > burst.raw_shots[i - 1].timestamp_ms, "Timestamps must be strictly monotonic");
+            ASSERT_TRUE(burst.raw_shots[i].interval_ms > 0.0f, "Intervals must be positive");
+            ASSERT_TRUE(burst.raw_shots[i].source == "simulated", "Source is 'simulated'");
+        }
+
+        // Verify cumulative calculation accuracy
+        float manual_cum_x = 0.0f;
+        float manual_cum_y = 0.0f;
+        for (const auto& s : burst.raw_shots) {
+            manual_cum_x += s.delta_x;
+            manual_cum_y += s.delta_y;
+            ASSERT_NEAR(s.cum_x, manual_cum_x, 1e-4f, "Cumulative X matches sum of delta X");
+            ASSERT_NEAR(s.cum_y, manual_cum_y, 1e-4f, "Cumulative Y matches sum of delta Y");
+        }
+
+        // Average interval check: 720 RPM ideal is ~83.33ms
+        float total_time = static_cast<float>(burst.raw_shots.back().timestamp_ms);
+        float avg_interval = total_time / 29.0f; // 29 intervals for 30 shots
+        ASSERT_NEAR(avg_interval, 83.33f, 3.0f, "Average interval must be close to ~83.3ms for 720 RPM");
+    }
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "ALL 6 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "ALL 8 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
