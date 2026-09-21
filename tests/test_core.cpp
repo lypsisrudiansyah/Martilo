@@ -368,8 +368,82 @@ int main() {
         ASSERT_TRUE(!udpAdapter.IsActive(), "UDP adapter successfully stopped");
     }
 
+    // --- TEST 13: Milestone 3 Task 3.2 Weapon Profile Management (Create, Duplicate, Status) ---
+    {
+        std::vector<Recoil::WeaponProfile> profileList;
+
+        // 3.2.1 Create Profile
+        Recoil::WeaponProfile p1;
+        p1.weapon_id = "rifle_m4a1";
+        p1.weapon_name = "M4A1 Carbine";
+        p1.fire_rate_rpm = 720;
+        p1.magazine_size = 30;
+        p1.fire_mode = "Full-Auto";
+        p1.status = Recoil::ProfileStatus::Draft;
+        p1.profile_version = 1;
+        profileList.push_back(p1);
+
+        ASSERT_TRUE(profileList.size() == 1, "Profile list has 1 item");
+        ASSERT_TRUE(profileList[0].weapon_id == "rifle_m4a1", "Weapon ID matches");
+        ASSERT_TRUE(profileList[0].status == Recoil::ProfileStatus::Draft, "Initial status is Draft");
+
+        // 3.2.2 Status Transitions
+        profileList[0].status = Recoil::ProfileStatus::Tested;
+        ASSERT_TRUE(Recoil::ProfileStatusToString(profileList[0].status) == "Tested", "Status transitioned to Tested");
+        profileList[0].status = Recoil::ProfileStatus::Approved;
+        ASSERT_TRUE(Recoil::ProfileStatusToString(profileList[0].status) == "Approved", "Status transitioned to Approved");
+
+        // 3.2.3 Duplicate Profile
+        Recoil::WeaponProfile copy = profileList[0];
+        copy.weapon_name += " (Copy)";
+        copy.weapon_id += "_copy";
+        copy.status = Recoil::ProfileStatus::Draft;
+        copy.profile_version = 1;
+        profileList.push_back(copy);
+
+        ASSERT_TRUE(profileList.size() == 2, "Profile list now has 2 items after duplicate");
+        ASSERT_TRUE(profileList[1].weapon_name == "M4A1 Carbine (Copy)", "Duplicated weapon name matches");
+        ASSERT_TRUE(profileList[1].status == Recoil::ProfileStatus::Draft, "Duplicated weapon status resets to Draft");
+
+        // Delete Profile
+        profileList.erase(profileList.begin());
+        ASSERT_TRUE(profileList.size() == 1, "Profile list has 1 item after deletion");
+        ASSERT_TRUE(profileList[0].weapon_id == "rifle_m4a1_copy", "Remaining profile is the duplicate");
+    }
+
+    // --- TEST 14: Milestone 3 Task 3.3 Recording Controller & Multi-Recording Visibility Flag ---
+    {
+        Recoil::WeaponProfile wpn;
+        wpn.weapon_id = "test_smg";
+
+        // Generate 3 simulated recordings
+        for (int i = 1; i <= 3; ++i) {
+            Recoil::BurstGeneratorConfig cfg;
+            cfg.shot_count = 10;
+            cfg.rpm = 600;
+            cfg.seed = 100 + i;
+            Recoil::BurstRecording rec = Recoil::MockBurstGenerator::GenerateBurst(cfg, "burst_" + std::to_string(i));
+            ASSERT_TRUE(rec.is_visible, "New recording must be visible by default (is_visible == true)");
+            wpn.recordings.push_back(rec);
+        }
+
+        ASSERT_TRUE(wpn.recordings.size() == 3, "Weapon profile holds 3 recordings");
+
+        // 3.3.3 Checkbox visibilitas per recording untuk overlay
+        wpn.recordings[1].is_visible = false; // Hide recording #2
+
+        int visibleCount = 0;
+        for (const auto& r : wpn.recordings) {
+            if (r.is_visible) visibleCount++;
+        }
+        ASSERT_TRUE(visibleCount == 2, "Exactly 2 recordings are visible after toggling off burst #2");
+        ASSERT_TRUE(!wpn.recordings[1].is_visible, "Burst #2 is_visible flag is false");
+        ASSERT_TRUE(wpn.recordings[0].is_visible, "Burst #1 is_visible flag is true");
+        ASSERT_TRUE(wpn.recordings[2].is_visible, "Burst #3 is_visible flag is true");
+    }
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "ALL 12 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "ALL 14 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }

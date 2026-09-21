@@ -49,6 +49,7 @@ struct BurstRecording {
     std::string recording_id;
     std::string timestamp_iso;       // Waktu saat recording dibuat
     std::string notes;
+    bool is_visible = true;          // Flag visibilitas untuk overlay chart (Task 3.3.3)
     std::vector<ShotData> raw_shots; // IMMUTABLE: Tidak boleh di-overwrite saat cleaning
 
     // Helper checks
