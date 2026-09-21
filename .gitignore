@@ -1,0 +1,25 @@
+# Binaries and build artifacts
+build/
+bin/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.pdb
+*.dSYM/
+
+# Editor and IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.workspace
+*.layout
+
+# Project outputs & temporary files
+recordings/
+exports/
+scratch/
+*.log
