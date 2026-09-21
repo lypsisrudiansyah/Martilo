@@ -51,6 +51,13 @@ public:
     float manualDeltaY = -3.0f;
     int udpPort = 9988;
 
+    // Task 4.1, 4.2, 4.3 Selection and Display Settings
+    int selectedShotIndex{-1};             // 1-based index shot yang dipilih untuk sinkronisasi 2 arah
+    bool showShotNumbers{true};            // Task 4.1.4: Tampilkan nomor urut shot di canvas
+    bool invertYAxis{true};                // Task 4.1.2: Orientasi sumbu Y (invert Y agar recoil naik ke atas)
+    bool shouldScrollToSelectedShot{false}; // Task 4.3.2: Auto scroll tabel saat shot dipilih dari chart
+    int perShotMetricTab{0};               // Task 4.2: Tab aktif per-shot metrics (0: ΔX, 1: ΔY, 2: Interval, 3: All)
+
     UIManager() {
         // Setup profil default awal jika kosong
         WeaponProfile defaultWpn;
@@ -216,6 +223,7 @@ public:
             ImGui::DockBuilderDockWindow("Burst Recording Controller", dock_left_id);
 
             ImGui::DockBuilderDockWindow("Recoil Trajectory (2D)", dock_main_id);
+            ImGui::DockBuilderDockWindow("Per-Shot Metric Plots", dock_main_id);
 
             ImGui::DockBuilderDockWindow("Shot Data Inspector", dock_bottom_id);
 
@@ -603,7 +611,7 @@ public:
         snprintf(inputNotes, sizeof(inputNotes), "%s", active->notes.c_str());
     }
 
-    // Render Trajectory 2D Plot dengan Multi-Recording Overlay (Task 3.3.3)
+    // Task 4.1: Recoil Trajectory 2D Plot (Cumulative X/Y)
     void RenderTrajectoryChart() {
         ImGui::Begin("Recoil Trajectory (2D)");
         WeaponProfile* active = GetActiveWeapon();
@@ -613,34 +621,119 @@ public:
             return;
         }
 
+        // Toolbar Kontrol Visualisasi (Task 4.1.2 & 4.1.4)
+        ImGui::Checkbox("Invert Y (Recoil Climb Up)", &invertYAxis);
+        ImGui::SameLine();
+        ImGui::Checkbox("Show Shot # Numbers", &showShotNumbers);
+        
+        if (selectedShotIndex > 0) {
+            ImGui::SameLine();
+            char selText[64];
+            snprintf(selText, sizeof(selText), "Clear Selection (Shot #%d)", selectedShotIndex);
+            if (ImGui::SmallButton(selText)) {
+                selectedShotIndex = -1;
+            }
+        }
+
         int visibleCount = 0;
         for (const auto& rec : active->recordings) {
             if (rec.is_visible) visibleCount++;
         }
 
-        ImGui::Text("Active Weapon: %s | Total Recordings: %d | Visible Overlays: %d",
+        ImGui::TextDisabled("Active Weapon: %s | Profiles: %d | Visible Overlays: %d",
             active->weapon_name.c_str(), (int)active->recordings.size(), visibleCount);
 
-        if (ImPlot::BeginPlot("Trajectory (Cumulative X / -Y)", ImVec2(-1, -1))) {
-            ImPlot::SetupAxes("Cumulative Horizontal Drift (X)", "Cumulative Upward Climb (-Y)");
+        // 4.1.1 Setup ImPlot 2D canvas
+        const char* yAxisLabel = invertYAxis ? "Cumulative Upward Climb (-Y px)" : "Cumulative Vertical Displacement (+Y px)";
+        if (ImPlot::BeginPlot("##TrajectoryCanvas", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("Cumulative Horizontal Drift (X px)", yAxisLabel);
+
+            // Variable untuk mendeteksi hover dan highlight
+            int hoveredShotNum = -1;
+            ShotData hoveredShotData;
+            bool hasHoveredShot = false;
+            ImVec2 hoveredPointPix;
+            ImVec2 mousePos = ImGui::GetMousePos();
+            bool isPlotHovered = ImPlot::IsPlotHovered();
 
             for (size_t r = 0; r < active->recordings.size(); ++r) {
                 const auto& rec = active->recordings[r];
-                // Task 3.3.3: Hormati flag is_visible
                 if (!rec.is_visible || rec.raw_shots.empty()) continue;
 
+                // Ekstraksi koordinat kumulatif X dan Y
                 std::vector<float> xs(rec.raw_shots.size());
                 std::vector<float> ys(rec.raw_shots.size());
                 for (size_t s = 0; s < rec.raw_shots.size(); ++s) {
                     xs[s] = rec.raw_shots[s].cum_x;
-                    ys[s] = -rec.raw_shots[s].cum_y; // Invert Y agar moncong naik ke atas
+                    // Task 4.1.2: Invert sumbu Y
+                    ys[s] = invertYAxis ? -rec.raw_shots[s].cum_y : rec.raw_shots[s].cum_y;
                 }
 
                 std::string lineLabel = rec.recording_id + " (Line)";
                 std::string scatterLabel = rec.recording_id;
 
+                // 4.1.1 Render Line dan Scatter plot
                 ImPlot::PlotLine(lineLabel.c_str(), xs.data(), ys.data(), (int)xs.size());
                 ImPlot::PlotScatter(scatterLabel.c_str(), xs.data(), ys.data(), (int)xs.size());
+
+                // 4.1.4 Tampilan nomor urut shot di setiap point plot
+                if (showShotNumbers) {
+                    for (size_t s = 0; s < rec.raw_shots.size(); ++s) {
+                        std::string numStr = std::to_string(rec.raw_shots[s].shot_index);
+                        ImPlot::PlotText(numStr.c_str(), xs[s], ys[s], ImVec2(0, -9));
+                    }
+                }
+
+                // Label titik awal (Start) dan akhir (End)
+                ImPlot::PlotText("[Start]", xs.front(), ys.front(), ImVec2(0, 10));
+                if (xs.size() > 1) {
+                    ImPlot::PlotText("[End]", xs.back(), ys.back(), ImVec2(0, 10));
+                }
+
+                // 4.1.3 Deteksi Hover untuk interactive tooltip & klik seleksi
+                if (isPlotHovered) {
+                    for (size_t s = 0; s < rec.raw_shots.size(); ++s) {
+                        ImVec2 ptPix = ImPlot::PlotToPixels(xs[s], ys[s]);
+                        float dX = ptPix.x - mousePos.x;
+                        float dY = ptPix.y - mousePos.y;
+                        if ((dX * dX + dY * dY) <= (14.0f * 14.0f)) { // Radius hover 14 pixel
+                            hoveredShotNum = rec.raw_shots[s].shot_index;
+                            hoveredShotData = rec.raw_shots[s];
+                            hoveredPointPix = ptPix;
+                            hasHoveredShot = true;
+                        }
+                    }
+                }
+
+                // 4.3.2 Highlight visual titik yang sedang dipilih pada rekaman aktif
+                if (selectedRecordingIdx == static_cast<int>(r) && selectedShotIndex > 0 && selectedShotIndex <= static_cast<int>(rec.raw_shots.size())) {
+                    size_t selIdx = selectedShotIndex - 1;
+                    ImVec2 selPix = ImPlot::PlotToPixels(xs[selIdx], ys[selIdx]);
+                    ImDrawList* drawList = ImPlot::GetPlotDrawList();
+                    // Lingkaran cincin emas bersinar
+                    drawList->AddCircle(selPix, 11.0f, IM_COL32(255, 220, 30, 255), 24, 3.0f);
+                    drawList->AddCircleFilled(selPix, 4.5f, IM_COL32(255, 230, 80, 220));
+                }
+            }
+
+            // Task 4.1.3 Tooltip interaktif saat hover di titik shot
+            if (hasHoveredShot) {
+                ImGui::BeginTooltip();
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), "Shot #%d Details", hoveredShotData.shot_index);
+                ImGui::Separator();
+                ImGui::Text("Timestamp: %lld ms (Interval: %.1f ms)", (long long)hoveredShotData.timestamp_ms, hoveredShotData.interval_ms);
+                ImGui::Text("Delta: ΔX = %+.2f px, ΔY = %+.2f px", hoveredShotData.delta_x, hoveredShotData.delta_y);
+                ImGui::Text("Cumulative: X = %+.2f px, Y = %+.2f px", hoveredShotData.cum_x, hoveredShotData.cum_y);
+                ImGui::TextDisabled("Source: %s", hoveredShotData.source.c_str());
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "Click point to highlight in Shot Table");
+                ImGui::EndTooltip();
+
+                // Task 4.3.2 Klik pada titik di grafik menyorot baris tabel
+                if (ImGui::IsMouseClicked(0)) {
+                    selectedShotIndex = hoveredShotNum;
+                    shouldScrollToSelectedShot = true;
+                }
             }
 
             ImPlot::EndPlot();
@@ -649,21 +742,187 @@ public:
         ImGui::End();
     }
 
-    // Render Shot Data Table Inspector
+    // Task 4.2: Per-Shot Metric Plots (Time Series)
+    void RenderPerShotMetricPlots() {
+        ImGui::Begin("Per-Shot Metric Plots");
+        WeaponProfile* active = GetActiveWeapon();
+        if (!active || active->recordings.empty() || selectedRecordingIdx < 0 || selectedRecordingIdx >= static_cast<int>(active->recordings.size())) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Select a burst recording in the sidebar to inspect per-shot time series metrics.");
+            ImGui::End();
+            return;
+        }
+
+        const auto& rec = active->recordings[selectedRecordingIdx];
+        if (rec.raw_shots.empty()) {
+            ImGui::TextDisabled("Recording '%s' has no shots.", rec.recording_id.c_str());
+            ImGui::End();
+            return;
+        }
+
+        size_t n = rec.raw_shots.size();
+        std::vector<float> indices(n);
+        std::vector<float> deltaXs(n);
+        std::vector<float> deltaYs(n);
+        std::vector<float> intervals(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            indices[i] = static_cast<float>(rec.raw_shots[i].shot_index);
+            deltaXs[i] = rec.raw_shots[i].delta_x;
+            deltaYs[i] = rec.raw_shots[i].delta_y;
+            intervals[i] = rec.raw_shots[i].interval_ms;
+        }
+
+        ImGui::Text("Active Burst: %s (%d shots) | RPM: %d", rec.recording_id.c_str(), (int)n, active->fire_rate_rpm);
+
+        if (ImGui::BeginTabBar("MetricPlotsTabBar")) {
+            // Task 4.2.1: Plot ΔX vs Shot Index (Pergerakan horizontal per peluru)
+            if (ImGui::BeginTabItem("ΔX vs Shot Index")) {
+                if (ImPlot::BeginPlot("##DeltaXPlot", ImVec2(-1, -1))) {
+                    ImPlot::SetupAxes("Shot Index", "Horizontal Displacement ΔX (px)");
+                    
+                    // Garis referensi nol (Center baseline)
+                    float refX[2] = { 1.0f, static_cast<float>(n) };
+                    float refY[2] = { 0.0f, 0.0f };
+                    ImPlot::PlotLine("Baseline (0 px)", refX, refY, 2);
+
+                    ImPlot::PlotLine("ΔX Sequence", indices.data(), deltaXs.data(), (int)n);
+                    ImPlot::PlotScatter("Shots", indices.data(), deltaXs.data(), (int)n);
+
+                    // Highlight selected shot
+                    if (selectedShotIndex >= 1 && selectedShotIndex <= static_cast<int>(n)) {
+                        size_t idx = selectedShotIndex - 1;
+                        ImVec2 pix = ImPlot::PlotToPixels(indices[idx], deltaXs[idx]);
+                        ImPlot::GetPlotDrawList()->AddCircle(pix, 9.0f, IM_COL32(255, 220, 30, 255), 18, 2.5f);
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Task 4.2.2: Plot ΔY vs Shot Index (Hentakan vertikal per peluru)
+            if (ImGui::BeginTabItem("ΔY vs Shot Index")) {
+                if (ImPlot::BeginPlot("##DeltaYPlot", ImVec2(-1, -1))) {
+                    ImPlot::SetupAxes("Shot Index", "Vertical Recoil ΔY (px)");
+
+                    // Garis rata-rata hentakan vertikal
+                    float sumY = 0.0f;
+                    for (float dy : deltaYs) sumY += dy;
+                    float meanY = sumY / static_cast<float>(n);
+
+                    float refX[2] = { 1.0f, static_cast<float>(n) };
+                    float refY[2] = { meanY, meanY };
+                    char meanLabel[64];
+                    snprintf(meanLabel, sizeof(meanLabel), "Mean ΔY (%.2f px)", meanY);
+                    ImPlot::PlotLine(meanLabel, refX, refY, 2);
+
+                    ImPlot::PlotLine("ΔY Sequence", indices.data(), deltaYs.data(), (int)n);
+                    ImPlot::PlotScatter("Shots", indices.data(), deltaYs.data(), (int)n);
+
+                    // Highlight selected shot
+                    if (selectedShotIndex >= 1 && selectedShotIndex <= static_cast<int>(n)) {
+                        size_t idx = selectedShotIndex - 1;
+                        ImVec2 pix = ImPlot::PlotToPixels(indices[idx], deltaYs[idx]);
+                        ImPlot::GetPlotDrawList()->AddCircle(pix, 9.0f, IM_COL32(255, 220, 30, 255), 18, 2.5f);
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // Task 4.2.3: Plot Interval vs Shot Index (Verifikasi konsistensi RPM)
+            if (ImGui::BeginTabItem("Interval (ms) vs Shot")) {
+                if (ImPlot::BeginPlot("##IntervalPlot", ImVec2(-1, -1))) {
+                    ImPlot::SetupAxes("Shot Index", "Time Interval (ms)");
+
+                    // Target interval RPM teoritis
+                    float targetInterval = Math::RpmToIntervalMs(active->fire_rate_rpm);
+                    float refX[2] = { 1.0f, static_cast<float>(n) };
+                    float refY[2] = { targetInterval, targetInterval };
+                    char rpmLabel[64];
+                    snprintf(rpmLabel, sizeof(rpmLabel), "Target RPM %d (%.1f ms)", active->fire_rate_rpm, targetInterval);
+                    ImPlot::PlotLine(rpmLabel, refX, refY, 2);
+
+                    ImPlot::PlotLine("Actual Interval", indices.data(), intervals.data(), (int)n);
+                    ImPlot::PlotScatter("Intervals", indices.data(), intervals.data(), (int)n);
+
+                    // Highlight selected shot
+                    if (selectedShotIndex >= 1 && selectedShotIndex <= static_cast<int>(n)) {
+                        size_t idx = selectedShotIndex - 1;
+                        ImVec2 pix = ImPlot::PlotToPixels(indices[idx], intervals[idx]);
+                        ImPlot::GetPlotDrawList()->AddCircle(pix, 9.0f, IM_COL32(255, 220, 30, 255), 18, 2.5f);
+                    }
+
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
+            // All 3 Plots Stacked (Overview lengkap)
+            if (ImGui::BeginTabItem("All 3 Stacked Overview")) {
+                float subPlotHeight = (ImGui::GetContentRegionAvail().y - 30.0f) / 3.0f;
+                if (subPlotHeight < 120.0f) subPlotHeight = 120.0f;
+
+                if (ImPlot::BeginPlot("##DeltaXSub", ImVec2(-1, subPlotHeight))) {
+                    ImPlot::SetupAxes("Shot", "ΔX (px)");
+                    ImPlot::PlotLine("ΔX", indices.data(), deltaXs.data(), (int)n);
+                    ImPlot::PlotScatter("##ptsX", indices.data(), deltaXs.data(), (int)n);
+                    ImPlot::EndPlot();
+                }
+
+                if (ImPlot::BeginPlot("##DeltaYSub", ImVec2(-1, subPlotHeight))) {
+                    ImPlot::SetupAxes("Shot", "ΔY (px)");
+                    ImPlot::PlotLine("ΔY", indices.data(), deltaYs.data(), (int)n);
+                    ImPlot::PlotScatter("##ptsY", indices.data(), deltaYs.data(), (int)n);
+                    ImPlot::EndPlot();
+                }
+
+                if (ImPlot::BeginPlot("##IntervalSub", ImVec2(-1, subPlotHeight))) {
+                    ImPlot::SetupAxes("Shot", "Interval (ms)");
+                    ImPlot::PlotLine("Interval", indices.data(), intervals.data(), (int)n);
+                    ImPlot::PlotScatter("##ptsInt", indices.data(), intervals.data(), (int)n);
+                    ImPlot::EndPlot();
+                }
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
+        }
+
+        ImGui::End();
+    }
+
+    // Task 4.3: Per-Shot Data Table (Virtual Table & 2-Way Selection Sync)
     void RenderShotTable() {
         ImGui::Begin("Shot Data Inspector");
         WeaponProfile* active = GetActiveWeapon();
         if (active && selectedRecordingIdx >= 0 && selectedRecordingIdx < static_cast<int>(active->recordings.size())) {
             const auto& rec = active->recordings[selectedRecordingIdx];
-            ImGui::Text("Inspecting: %s (%d shots, Total Drift: X=%.2f, Y=%.2f)",
+            
+            // Header bar tabel & info seleksi
+            ImGui::Text("Burst: %s (%d shots, Total Drift: X=%.2f px, Y=%.2f px)",
                 rec.recording_id.c_str(), (int)rec.ShotCount(), 
                 rec.raw_shots.empty() ? 0.0f : rec.raw_shots.back().cum_x,
                 rec.raw_shots.empty() ? 0.0f : rec.raw_shots.back().cum_y);
 
+            if (selectedShotIndex > 0 && selectedShotIndex <= static_cast<int>(rec.raw_shots.size())) {
+                const auto& sel = rec.raw_shots[selectedShotIndex - 1];
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f), 
+                    "| Selected Shot #%d: Time=%lld ms, Δ=(%.2f, %.2f), Cum=(%.2f, %.2f)",
+                    sel.shot_index, (long long)sel.timestamp_ms, sel.delta_x, sel.delta_y, sel.cum_x, sel.cum_y);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Deselect")) {
+                    selectedShotIndex = -1;
+                }
+            }
+
+            // 4.3.1 Tabel Virtual dengan 8 kolom lengkap sesuai schema PRD 6.3
             if (ImGui::BeginTable("InspectorTable", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-                ImGui::TableSetupColumn("Shot #", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                ImGui::TableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn("Interval (ms)", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                ImGui::TableSetupColumn("Shot #", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                ImGui::TableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthFixed, 85.0f);
+                ImGui::TableSetupColumn("Interval (ms)", ImGuiTableColumnFlags_WidthFixed, 95.0f);
                 ImGui::TableSetupColumn("Delta X", ImGuiTableColumnFlags_WidthFixed, 75.0f);
                 ImGui::TableSetupColumn("Delta Y", ImGuiTableColumnFlags_WidthFixed, 75.0f);
                 ImGui::TableSetupColumn("Cum X", ImGuiTableColumnFlags_WidthFixed, 75.0f);
@@ -673,13 +932,41 @@ public:
 
                 for (const auto& shot : rec.raw_shots) {
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::Text("%d", shot.shot_index);
+
+                    // Task 4.3.2: Sinkronisasi seleksi baris
+                    bool isRowSelected = (selectedShotIndex == shot.shot_index);
+                    if (isRowSelected) {
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(70, 90, 130, 200));
+                    }
+
+                    // Kolom 0: Shot # (Selectable span all columns)
+                    ImGui::TableNextColumn();
+                    char rowLabel[32];
+                    snprintf(rowLabel, sizeof(rowLabel), "%d", shot.shot_index);
+
+                    if (ImGui::Selectable(rowLabel, isRowSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        selectedShotIndex = shot.shot_index; // Klik baris menyorot di grafik
+                    }
+
+                    // Auto-scroll ke baris saat diklik dari canvas chart 2D
+                    if (isRowSelected && shouldScrollToSelectedShot) {
+                        ImGui::SetScrollHereY(0.5f);
+                        shouldScrollToSelectedShot = false;
+                    }
+
+                    // Kolom 1: Time (ms)
                     ImGui::TableNextColumn(); ImGui::Text("%lld", (long long)shot.timestamp_ms);
+                    // Kolom 2: Interval (ms)
                     ImGui::TableNextColumn(); ImGui::Text("%.1f", shot.interval_ms);
+                    // Kolom 3: Delta X
                     ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.delta_x);
+                    // Kolom 4: Delta Y
                     ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.delta_y);
+                    // Kolom 5: Cum X
                     ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.cum_x);
+                    // Kolom 6: Cum Y
                     ImGui::TableNextColumn(); ImGui::Text("%.2f", shot.cum_y);
+                    // Kolom 7: Source
                     ImGui::TableNextColumn(); ImGui::Text("%s", shot.source.c_str());
                 }
                 ImGui::EndTable();

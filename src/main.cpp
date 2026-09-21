@@ -141,7 +141,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Center View: Recoil Trajectory 2D Chart with Multi-Recording Overlay (Task 3.1.3 & 3.3.3)
         g_uiManager.RenderTrajectoryChart();
 
-        // Bottom Panel: Shot Data Table Inspector (Task 3.1.3)
+        // Center View / Tab: Per-Shot Metric Plots (Task 4.2)
+        g_uiManager.RenderPerShotMetricPlots();
+
+        // Bottom Panel: Shot Data Table Inspector (Task 3.1.3 & 4.3)
         g_uiManager.RenderShotTable();
 
         // Right Panel: Live Telemetry & Burst Simulator (Task 3.1.3)

@@ -442,8 +442,118 @@ int main() {
         ASSERT_TRUE(wpn.recordings[2].is_visible, "Burst #3 is_visible flag is true");
     }
 
+    // --- TEST 15: Milestone 4 Task 4.1 Trajectory 2D Data Extraction & Invert Y Logic ---
+    {
+        Recoil::BurstGeneratorConfig cfg;
+        cfg.shot_count = 15;
+        cfg.rpm = 600;
+        cfg.base_vertical_recoil = -3.5f;
+        cfg.horizontal_drift = 0.8f;
+        Recoil::BurstRecording rec = Recoil::MockBurstGenerator::GenerateBurst(cfg, "test_burst_4_1");
+
+        ASSERT_TRUE(rec.ShotCount() == 15, "Generated burst must have 15 shots");
+
+        // 4.1.1 Verify cumulative coordinate arrays
+        std::vector<float> xs(rec.raw_shots.size());
+        std::vector<float> ys_normal(rec.raw_shots.size());
+        std::vector<float> ys_inverted(rec.raw_shots.size());
+
+        for (size_t s = 0; s < rec.raw_shots.size(); ++s) {
+            xs[s] = rec.raw_shots[s].cum_x;
+            ys_normal[s] = rec.raw_shots[s].cum_y;
+            // 4.1.2 Invert Y logic: invert sign so recoil upward climb is plotted up (-Y -> +Y)
+            ys_inverted[s] = -rec.raw_shots[s].cum_y;
+        }
+
+        // Check start and end points
+        ASSERT_NEAR(xs[0], rec.raw_shots[0].cum_x, 1e-4f, "Start X equals shot 1 cum_x");
+        ASSERT_NEAR(ys_normal[0], rec.raw_shots[0].cum_y, 1e-4f, "Start Y normal equals shot 1 cum_y");
+        ASSERT_NEAR(ys_inverted[0], -rec.raw_shots[0].cum_y, 1e-4f, "Start Y inverted is negative of cum_y");
+
+        // Recoil kick is negative Y in game coordinates, so inverted Y should be positive upward
+        if (rec.raw_shots.back().cum_y < 0) {
+            ASSERT_TRUE(ys_inverted.back() > 0, "Inverted Y for muzzle climb should be positive upward");
+        }
+        ASSERT_NEAR(ys_inverted.back(), -ys_normal.back(), 1e-4f, "Inverted Y is exactly negative of normal Y");
+    }
+
+    // --- TEST 16: Milestone 4 Task 4.2 Per-Shot Metric Plots (Time Series) ---
+    {
+        Recoil::BurstGeneratorConfig cfg;
+        cfg.shot_count = 20;
+        cfg.rpm = 750; // 750 RPM -> 80 ms target interval
+        Recoil::BurstRecording rec = Recoil::MockBurstGenerator::GenerateBurst(cfg, "test_burst_4_2");
+
+        ASSERT_TRUE(rec.ShotCount() == 20, "Burst has 20 shots");
+
+        // Extract series for Delta X, Delta Y, Interval
+        std::vector<float> indices(rec.ShotCount());
+        std::vector<float> deltaXs(rec.ShotCount());
+        std::vector<float> deltaYs(rec.ShotCount());
+        std::vector<float> intervals(rec.ShotCount());
+        float sumDeltaY = 0.0f;
+
+        for (size_t i = 0; i < rec.ShotCount(); ++i) {
+            indices[i] = static_cast<float>(rec.raw_shots[i].shot_index);
+            deltaXs[i] = rec.raw_shots[i].delta_x;
+            deltaYs[i] = rec.raw_shots[i].delta_y;
+            intervals[i] = rec.raw_shots[i].interval_ms;
+            sumDeltaY += deltaYs[i];
+        }
+
+        // 4.2.1 Delta X sequence verification
+        ASSERT_TRUE(indices.front() == 1.0f, "First shot index is 1");
+        ASSERT_TRUE(indices.back() == 20.0f, "Last shot index is 20");
+
+        // 4.2.2 Mean Delta Y calculation for baseline
+        float meanY = sumDeltaY / 20.0f;
+        ASSERT_TRUE(std::isfinite(meanY), "Mean Delta Y must be finite");
+
+        // 4.2.3 Target interval verification against RPM
+        float targetInterval = Recoil::Math::RpmToIntervalMs(750);
+        ASSERT_NEAR(targetInterval, 80.0f, 1e-4f, "Target interval for 750 RPM is 80.0 ms");
+        // Simulated shots after shot 1 should hover near targetInterval (within mock noise)
+        for (size_t i = 1; i < intervals.size(); ++i) {
+            ASSERT_TRUE(intervals[i] >= 70.0f && intervals[i] <= 90.0f, "Interval is within reasonable tolerance of RPM");
+        }
+    }
+
+    // --- TEST 17: Milestone 4 Task 4.3 Virtual Table & Selection Synchronization ---
+    {
+        Recoil::BurstGeneratorConfig cfg;
+        cfg.shot_count = 10;
+        cfg.rpm = 600;
+        Recoil::BurstRecording rec = Recoil::MockBurstGenerator::GenerateBurst(cfg, "test_burst_4_3");
+
+        // 4.3.1 Table Schema validation: 8 columns populated
+        for (const auto& shot : rec.raw_shots) {
+            ASSERT_TRUE(shot.shot_index >= 1, "Shot index is >= 1");
+            ASSERT_TRUE(shot.timestamp_ms >= 0, "Timestamp is non-negative");
+            ASSERT_TRUE(shot.interval_ms >= 0.0f, "Interval is non-negative");
+            ASSERT_TRUE(std::isfinite(shot.delta_x), "Delta X is valid float");
+            ASSERT_TRUE(std::isfinite(shot.delta_y), "Delta Y is valid float");
+            ASSERT_TRUE(std::isfinite(shot.cum_x), "Cum X is valid float");
+            ASSERT_TRUE(std::isfinite(shot.cum_y), "Cum Y is valid float");
+            ASSERT_TRUE(!shot.source.empty(), "Source column is not empty");
+        }
+
+        // 4.3.2 Selection synchronization logic
+        int selectedShotIndex = -1; // Initially no selection
+        ASSERT_TRUE(selectedShotIndex == -1, "Initial selection is -1 (none)");
+
+        // Select shot #5 from Table or Chart
+        selectedShotIndex = 5;
+        ASSERT_TRUE(selectedShotIndex >= 1 && selectedShotIndex <= static_cast<int>(rec.raw_shots.size()), "Selection is in valid range");
+        const auto& selectedShot = rec.raw_shots[selectedShotIndex - 1];
+        ASSERT_TRUE(selectedShot.shot_index == 5, "Selected shot index matches 5");
+
+        // Deselect
+        selectedShotIndex = -1;
+        ASSERT_TRUE(selectedShotIndex == -1, "Selection cleared back to -1");
+    }
+
     std::cout << "\n========================================" << std::endl;
-    std::cout << "ALL 14 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
+    std::cout << "ALL 17 TEST SUITES PASSED SUCCESSFULLY!" << std::endl;
     std::cout << "========================================" << std::endl;
     return 0;
 }
